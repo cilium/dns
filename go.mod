@@ -1,6 +1,6 @@
 module github.com/cilium/dns
 
-go 1.14
+go 1.18
 
 require (
 	golang.org/x/net v0.2.0
