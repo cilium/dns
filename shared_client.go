@@ -302,8 +302,13 @@ func (c *SharedClient) ExchangeSharedContext(ctx context.Context, m *Msg) (r *Ms
 	}
 
 	// Since c.requests is unbuffered, the handler is guaranteed to eventually close 'respCh'
-	resp := <-respCh
-	return resp.msg, resp.rtt, resp.err
+	select {
+	case resp := <-respCh:
+		return resp.msg, resp.rtt, resp.err
+	// This is just fail-safe mechanism in case there is another similar issue
+	case <-time.After(time.Minute):
+		return nil, 0, fmt.Errorf("timeout waiting for response")
+	}
 }
 
 // close closes and waits for the close to finish.
