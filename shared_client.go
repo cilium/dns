@@ -206,14 +206,26 @@ func handler(wg *sync.WaitGroup, client *Client, conn *Conn, requests chan reque
 		conn.Close()
 		close(receiverTrigger)
 
-		// Drain responses send by receive loop to allow it to exit.
+		// Drain responses sent by receive loop to allow it to exit.
 		// It may be repeatedly reading after an i/o timeout, for example.
+		// This range will be done only after the receive loop has returned
+		// and closed 'responses' in its defer function.
 		for range responses {
 		}
 
+		// Now cancel all the remaining waiters
 		for _, waiter := range waitingResponses {
 			waiter.ch <- sharedClientResponse{nil, 0, net.ErrClosed}
 			close(waiter.ch)
+		}
+
+		// Drain requests in case they come in while we are closing
+		// down. This loop is done only after 'requests' channel is closed in
+		// SharedClient.close() and it is not possible for new requests or timeouts
+		// to be sent on those closed channels.
+		for req := range requests {
+			req.ch <- sharedClientResponse{nil, 0, net.ErrClosed}
+			close(req.ch)
 		}
 	}()
 
@@ -226,7 +238,6 @@ func handler(wg *sync.WaitGroup, client *Client, conn *Conn, requests chan reque
 				// requests to be sent.
 				return
 			}
-			start := time.Now()
 
 			// Check if we already have a request with the same id
 			// Due to birthday paradox and the fact that ID is uint16
@@ -248,6 +259,7 @@ func handler(wg *sync.WaitGroup, client *Client, conn *Conn, requests chan reque
 				}
 			}
 
+			start := time.Now()
 			err := client.SendContext(req.ctx, req.msg, conn, start)
 			if err != nil {
 				req.ch <- sharedClientResponse{nil, 0, err}
@@ -310,6 +322,7 @@ func (c *SharedClient) ExchangeSharedContext(ctx context.Context, m *Msg) (r *Ms
 	select {
 	case c.requests <- request{ctx: ctx, msg: m, ch: respCh}:
 	case <-ctx.Done():
+		// request was not sent, no cleanup to do
 		return nil, 0, ctx.Err()
 	}
 
