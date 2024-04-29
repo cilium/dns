@@ -304,7 +304,9 @@ func (c *SharedClient) ExchangeSharedContext(ctx context.Context, m *Msg) (r *Ms
 	timeout := c.getTimeoutForRequest(c.Client.writeTimeout())
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	respCh := make(chan sharedClientResponse)
+	// Response channel is buffered with capacity of one. This quarantees that the handler can always send
+	// one response, even if we time out below and never actually receive the response.
+	respCh := make(chan sharedClientResponse, 1)
 	select {
 	case c.requests <- request{ctx: ctx, msg: m, ch: respCh}:
 	case <-ctx.Done():
