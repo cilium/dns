@@ -6,7 +6,9 @@ package dns
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -18,6 +20,138 @@ import (
 var (
 	clients = NewSharedClients()
 )
+
+func TestSharedWaiterQueue(t *testing.T) {
+	wq := newWaiterQueue()
+	if wq == nil {
+		t.Fatal("waiterQueue: nil")
+	}
+
+	// Add first entry
+	start := time.Now()
+	deadline := start.Add(50 * time.Millisecond)
+
+	ch1 := make(chan sharedClientResponse, 1)
+	wq.Insert(1, start, deadline, ch1)
+	if l := wq.Len(); l != 1 || len(wq.index) != 1 || len(wq.waiters) != 1 {
+		t.Errorf("waiterQueue: invalid length (%d != 1)", l)
+	}
+	if wq.waiters[0].start != start || wq.waiters[0].deadline != deadline {
+		t.Error("waiterQueue: invalid start or deadline")
+	}
+	if wq.Exists(1) != true {
+		t.Error("waiterQueue: Exists failed")
+	}
+	if wq.Exists(2) != false {
+		t.Error("waiterQueue: Exists2 failed")
+	}
+	timeout := wq.GetTimeout()
+	if timeout <= 0 || timeout > 50*time.Millisecond {
+		t.Error("waiterQueue: invalid timeout")
+	}
+
+	// second entry has an earlier deadline, so it should go to front
+	start = start.Add(-1 * time.Second)
+	deadline = start.Add(10 * time.Millisecond)
+
+	ch2 := make(chan sharedClientResponse, 1)
+	wq.Insert(2, start, deadline, ch2)
+	if l := wq.Len(); l != 2 || len(wq.index) != 2 || len(wq.waiters) != 2 {
+		t.Errorf("waiterQueue: invalid length (%d != 2)", l)
+	}
+	if wq.waiters[0].start != start || wq.waiters[0].deadline != deadline {
+		t.Errorf("waiterQueue: invalid start or deadline 2: %v", wq.waiters)
+	}
+
+	select {
+	case resp, _ := <-ch1:
+		t.Errorf("waiterQueue: unexpected response before Expored 1: %v", resp)
+	case resp, _ := <-ch2:
+		t.Errorf("waiterQueue: unexpected response before Expired 2: %v", resp)
+	default:
+	}
+
+	// Handle expired entries
+	wq.Expired()
+
+	// get the expired entry response
+	resp, ok := <-ch2
+	if !ok {
+		t.Error("waiterQueue: no response")
+	}
+	var neterr net.Error
+	if !errors.As(resp.err, &neterr) || !neterr.Timeout() {
+		t.Errorf("waiterQueue: error is not a timeout: %s", resp.err)
+	}
+
+	// Check that ch1 did not get anything
+	select {
+	case resp, ok := <-ch1:
+		t.Errorf("waiterQueue: unexpected response1: %v (k: %v)", resp, ok)
+	default:
+	}
+
+	// third entry has later deadline, so it should go to the back
+	start = time.Now()
+	deadline = start.Add(100 * time.Millisecond)
+
+	ch3 := make(chan sharedClientResponse, 1)
+	wq.Insert(3, start, deadline, ch3)
+	if l := wq.Len(); l != 2 || len(wq.index) != 2 || len(wq.waiters) != 2 {
+		t.Errorf("waiterQueue: invalid length (%d != 2)", l)
+	}
+	if wq.waiters[1].start != start || wq.waiters[1].deadline != deadline {
+		t.Errorf("waiterQueue: invalid start or deadline 3: %v", wq.waiters)
+	}
+
+	// Respond to the 3rd entry (uses wq.Dequeue())
+	resp = sharedClientResponse{&Msg{MsgHdr: MsgHdr{Id: 3}}, 0, nil}
+	wq.Respond(resp)
+	if l := wq.Len(); l != 1 || len(wq.index) != 1 || len(wq.waiters) != 1 {
+		t.Errorf("waiterQueue: invalid length (%d != 1)", l)
+	}
+
+	select {
+	// Check that ch1 did not get anything
+	case resp, ok := <-ch1:
+		t.Errorf("waiterQueue: unexpected response1: %v (k: %v)", resp, ok)
+	case resp, ok := <-ch3:
+		// Expecting
+		if !ok || resp.err != nil || resp.rtt <= 0 {
+			t.Errorf("waiterQueue: wrong response: %v", resp)
+		}
+	default:
+		t.Error("waiterQueue: should have received a response on ch3")
+	}
+
+	// FailAll
+	wq.FailAll(io.EOF)
+	if l := wq.Len(); l != 0 || len(wq.index) != 0 || len(wq.waiters) != 0 {
+		t.Errorf("waiterQueue: invalid length (%d != 0)", l)
+	}
+
+	select {
+	case resp, ok := <-ch1:
+		if !ok {
+			t.Errorf("waiterQueue: unexpected closure ch1: %v (k: %v)", resp, ok)
+		}
+		if resp.err != io.EOF {
+			t.Errorf("waiterQueue: unexpected error value on ch1: %s", resp.err)
+		}
+	default:
+		t.Errorf("ch1 should have received an error")
+	}
+
+	select {
+	case resp, ok := <-ch1:
+		if ok {
+			t.Errorf("waiterQueue: unexpected response ch1: %v (k: %v)", resp, ok)
+		}
+	default:
+		t.Errorf("ch1 should have been closed")
+	}
+
+}
 
 func TestSharedClientSync(t *testing.T) {
 	HandleFunc("miek.nl.", HelloServer)
