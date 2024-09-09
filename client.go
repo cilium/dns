@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,7 +34,7 @@ func isPacketConn(c net.Conn) bool {
 // A Conn represents a connection to a DNS server.
 type Conn struct {
 	net.Conn                         // a net.Conn holding the connection
-	UDPSize        uint16            // minimum receive buffer for UDP messages
+	UDPSize        atomic.Uint32     // minimum receive buffer for UDP messages (actually uint16, but there's no atomic variant)
 	TsigSecret     map[string]string // secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
 	TsigProvider   TsigProvider      // An implementation of the TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
 	tsigRequestMAC string
@@ -142,7 +143,7 @@ func (c *Client) DialContext(ctx context.Context, address string) (conn *Conn, e
 	if err != nil {
 		return nil, err
 	}
-	conn.UDPSize = c.UDPSize
+	conn.UDPSize.Store(uint32(c.UDPSize))
 	return conn, nil
 }
 
@@ -239,11 +240,11 @@ func (c *Client) SendContext(ctx context.Context, m *Msg, co *Conn, t time.Time)
 	opt := m.IsEdns0()
 	// If EDNS0 is used use that for size.
 	if opt != nil && opt.UDPSize() >= MinMsgSize {
-		co.UDPSize = opt.UDPSize()
+		co.UDPSize.Store(uint32(opt.UDPSize()))
 	}
 	// Otherwise use the client's configured UDP size.
 	if opt == nil && c.UDPSize >= MinMsgSize {
-		co.UDPSize = c.UDPSize
+		co.UDPSize.Store(uint32(c.UDPSize))
 	}
 
 	// write with the appropriate write timeout
@@ -301,8 +302,8 @@ func (co *Conn) ReadMsgHeader(hdr *Header) ([]byte, error) {
 	)
 
 	if isPacketConn(co.Conn) {
-		if co.UDPSize > MinMsgSize {
-			p = make([]byte, co.UDPSize)
+		if us := co.UDPSize.Load(); us > MinMsgSize {
+			p = make([]byte, us)
 		} else {
 			p = make([]byte, MinMsgSize)
 		}
@@ -436,7 +437,6 @@ func ExchangeContext(ctx context.Context, m *Msg, a string) (r *Msg, err error) 
 //	co.WriteMsg(m)
 //	in, _  := co.ReadMsg()
 //	co.Close()
-//
 func ExchangeConn(c net.Conn, m *Msg) (r *Msg, err error) {
 	println("dns: ExchangeConn: this function is deprecated")
 	co := new(Conn)
